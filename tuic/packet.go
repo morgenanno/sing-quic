@@ -86,12 +86,12 @@ func (m *udpMessage) headerSize() int {
 }
 
 func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
-	if message.data.Len() <= maxPacketSize {
+	udpMTU := maxPacketSize - message.headerSize()
+	if message.data.Len() <= udpMTU {
 		return []*udpMessage{message}
 	}
 	var fragments []*udpMessage
 	originPacket := message.data.Bytes()
-	udpMTU := maxPacketSize - message.headerSize()
 	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
 		fragment := allocMessage()
 		*fragment = *message
@@ -180,8 +180,11 @@ func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 
 func (c *udpPacketConn) needFragment() bool {
+	if c.udpMTU == 0 {
+		return false
+	}
 	nowTime := time.Now()
-	if c.udpMTU > 0 && nowTime.Sub(c.udpMTUTime) < 5*time.Second {
+	if nowTime.Sub(c.udpMTUTime) < 5*time.Second {
 		c.udpMTUTime = nowTime
 		return true
 	}
@@ -201,15 +204,11 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	if !destination.IsValid() {
 		return E.New("invalid destination address")
 	}
-	packetId := c.packetId.Add(1)
-	if packetId > math.MaxUint16 {
-		c.packetId.Store(0)
-		packetId = 0
-	}
+	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
 	message := allocMessage()
 	*message = udpMessage{
 		sessionID:     c.sessionID,
-		packetID:      uint16(packetId),
+		packetID:      packetId,
 		fragmentTotal: 1,
 		destination:   destination,
 		data:          buffer,
@@ -228,7 +227,7 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	if !errors.As(err, &tooLargeErr) {
 		return err
 	}
-	c.udpMTU = int(tooLargeErr.PeerMaxDatagramFrameSize)
+	c.udpMTU = int(tooLargeErr.PeerMaxDatagramFrameSize) - 3
 	c.udpMTUTime = time.Now()
 	return c.writePackets(fragUDPMessage(message, c.udpMTU))
 }
@@ -246,15 +245,11 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if !destination.IsValid() {
 		return 0, E.New("invalid destination address")
 	}
-	packetId := c.packetId.Add(1)
-	if packetId > math.MaxUint16 {
-		c.packetId.Store(0)
-		packetId = 0
-	}
+	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
 	message := allocMessage()
 	*message = udpMessage{
 		sessionID:     c.sessionID,
-		packetID:      uint16(packetId),
+		packetID:      packetId,
 		fragmentTotal: 1,
 		destination:   destination,
 		data:          buf.As(p),
@@ -274,7 +269,7 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if !errors.As(err, &tooLargeErr) {
 		return
 	}
-	c.udpMTU = int(tooLargeErr.PeerMaxDatagramFrameSize)
+	c.udpMTU = int(tooLargeErr.PeerMaxDatagramFrameSize) - 3
 	c.udpMTUTime = time.Now()
 	err = c.writePackets(fragUDPMessage(message, c.udpMTU))
 	if err == nil {
@@ -437,6 +432,11 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		}
 		item.messages = nil
 		return newMessage
+	} else {
+		newMessage.releaseMessage()
+		for _, message := range item.messages {
+			message.releaseMessage()
+		}
 	}
 	item.messages = nil
 	return nil
