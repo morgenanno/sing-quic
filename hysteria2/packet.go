@@ -135,7 +135,7 @@ func newUDPPacketConn(ctx context.Context, quicConn quic.Connection, onDestroy f
 		cancel:    cancel,
 		quicConn:  quicConn,
 		data:      make(chan *udpMessage, 64),
-		udpMTU:    1200,
+		udpMTU:    1200 - 3,
 		defragger: newUDPDefragger(),
 		onDestroy: onDestroy,
 	}
@@ -306,6 +306,14 @@ func (c *udpPacketConn) SetReadDeadline(t time.Time) error {
 
 func (c *udpPacketConn) SetWriteDeadline(t time.Time) error {
 	return os.ErrInvalid
+}
+
+func (c *udpPacketConn) ReaderMTU() int {
+	return protocol.MaxUDPSize
+}
+
+func (c *udpPacketConn) WriterMTU() int {
+	return protocol.MaxUDPSize
 }
 
 type udpDefragger struct {
