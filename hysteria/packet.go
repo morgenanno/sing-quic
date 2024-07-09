@@ -88,12 +88,12 @@ func (m *udpMessage) headerSize() int {
 }
 
 func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
-	if message.data.Len() <= maxPacketSize {
+	udpMTU := maxPacketSize - message.headerSize()
+	if message.data.Len() <= udpMTU {
 		return []*udpMessage{message}
 	}
 	var fragments []*udpMessage
 	originPacket := message.data.Bytes()
-	udpMTU := maxPacketSize - message.headerSize()
 	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
 		fragment := allocMessage()
 		*fragment = *message
@@ -125,7 +125,6 @@ type udpPacketConn struct {
 	quicConn        quic.Connection
 	data            chan *udpMessage
 	udpMTU          int
-	udpMTUTime      time.Time
 	packetId        atomic.Uint32
 	closeOnce       sync.Once
 	defragger       *udpDefragger
@@ -140,6 +139,7 @@ func newUDPPacketConn(ctx context.Context, quicConn quic.Connection, onDestroy f
 		cancel:    cancel,
 		quicConn:  quicConn,
 		data:      make(chan *udpMessage, 64),
+		udpMTU:    1200 - 3,
 		defragger: newUDPDefragger(),
 		onDestroy: onDestroy,
 	}
@@ -174,15 +174,6 @@ func (c *udpPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	}
 }
 
-func (c *udpPacketConn) needFragment() bool {
-	nowTime := time.Now()
-	if c.udpMTU > 0 && nowTime.Sub(c.udpMTUTime) < 5*time.Second {
-		c.udpMTUTime = nowTime
-		return true
-	}
-	return false
-}
-
 func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
 	select {
@@ -191,17 +182,13 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	default:
 	}
 	if buffer.Len() > 0xffff {
-		return quic.ErrMessageTooLarge(0xffff)
+		return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 0xffff}
 	}
-	packetId := c.packetId.Add(1)
-	if packetId > math.MaxUint16 {
-		c.packetId.Store(0)
-		packetId = 0
-	}
+	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
 	message := allocMessage()
 	*message = udpMessage{
 		sessionID:     c.sessionID,
-		packetID:      uint16(packetId),
+		packetID:      packetId,
 		fragmentTotal: 1,
 		host:          destination.AddrString(),
 		port:          destination.Port,
@@ -209,7 +196,7 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	}
 	defer message.releaseMessage()
 	var err error
-	if c.needFragment() && buffer.Len() > c.udpMTU {
+	if buffer.Len() > c.udpMTU-message.headerSize() {
 		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
 	} else {
 		err = c.writePacket(message)
@@ -217,13 +204,11 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
 	if err == nil {
 		return nil
 	}
-	var tooLargeErr quic.ErrMessageTooLarge
+	var tooLargeErr *quic.DatagramTooLargeError
 	if !errors.As(err, &tooLargeErr) {
 		return err
 	}
-	c.udpMTU = int(tooLargeErr)
-	c.udpMTUTime = time.Now()
-	return c.writePackets(fragUDPMessage(message, c.udpMTU))
+	return c.writePackets(fragUDPMessage(message, int(tooLargeErr.MaxDatagramPayloadSize-3)))
 }
 
 func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -233,24 +218,20 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	default:
 	}
 	if len(p) > 0xffff {
-		return 0, quic.ErrMessageTooLarge(0xffff)
+		return 0, &quic.DatagramTooLargeError{MaxDatagramPayloadSize: 0xffff}
 	}
-	packetId := c.packetId.Add(1)
-	if packetId > math.MaxUint16 {
-		c.packetId.Store(0)
-		packetId = 0
-	}
+	packetId := uint16(c.packetId.Add(1) % math.MaxUint16)
 	message := allocMessage()
 	destination := M.SocksaddrFromNet(addr)
 	*message = udpMessage{
 		sessionID:     c.sessionID,
-		packetID:      uint16(packetId),
+		packetID:      packetId,
 		fragmentTotal: 1,
 		host:          destination.AddrString(),
 		port:          destination.Port,
 		data:          buf.As(p),
 	}
-	if c.needFragment() && len(p) > c.udpMTU {
+	if len(p) > c.udpMTU-message.headerSize() {
 		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
 		if err == nil {
 			return len(p), nil
@@ -261,13 +242,11 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	if err == nil {
 		return len(p), nil
 	}
-	var tooLargeErr quic.ErrMessageTooLarge
+	var tooLargeErr *quic.DatagramTooLargeError
 	if !errors.As(err, &tooLargeErr) {
 		return
 	}
-	c.udpMTU = int(tooLargeErr)
-	c.udpMTUTime = time.Now()
-	err = c.writePackets(fragUDPMessage(message, c.udpMTU))
+	err = c.writePackets(fragUDPMessage(message, int(tooLargeErr.MaxDatagramPayloadSize-3)))
 	if err == nil {
 		return len(p), nil
 	}
@@ -400,6 +379,11 @@ func (d *udpDefragger) feed(m *udpMessage) *udpMessage {
 		}
 		item.messages = nil
 		return newMessage
+	} else {
+		newMessage.release()
+		for _, message := range item.messages {
+			message.releaseMessage()
+		}
 	}
 	item.messages = nil
 	return nil

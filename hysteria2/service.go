@@ -214,7 +214,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSender(
 				congestion_meta2.DefaultClock{TimeFunc: timeFunc},
-				congestion_meta2.GetInitialPacketSize(s.quicConn.RemoteAddr()),
+				congestion.ByteCount(s.quicConn.Config().InitialPacketSize),
 				congestion.ByteCount(congestion_meta1.InitialCongestionWindow),
 			))
 		}
@@ -241,7 +241,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *serverSession[U]) handleStream0(frameType http3.FrameType, connection quic.Connection, stream quic.Stream, err error) (bool, error) {
+func (s *serverSession[U]) handleStream0(frameType http3.FrameType, id quic.ConnectionTracingID, stream quic.Stream, err error) (bool, error) {
 	if !s.authenticated || err != nil {
 		return false, nil
 	}
